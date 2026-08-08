@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from sentinel.agent.loop import run_turn
 from sentinel.db import connect
 from sentinel.safety.preview import PreviewResult, approve_and_commit, preview_sql
 
@@ -20,6 +21,11 @@ class PreviewRequest(BaseModel):
 
 class ApproveRequest(BaseModel):
     action_id: UUID
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1)
+    session_id: UUID | None = None
 
 
 class HealthResponse(BaseModel):
@@ -212,6 +218,43 @@ def create_app() -> FastAPI:
             )
             events = list(cur.fetchall())
         return {"action": action, "events": events}
+
+    @app.post("/chat")
+    def chat(body: ChatRequest) -> dict[str, Any]:
+        try:
+            result = run_turn(
+                body.message,
+                session_id=str(body.session_id) if body.session_id else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return result
+
+    @app.get("/sessions/{session_id}/messages")
+    def session_messages(session_id: UUID) -> dict[str, Any]:
+        with connect(autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, role, content, created_at
+                FROM sentinel.messages
+                WHERE session_id = %s
+                ORDER BY created_at
+                """,
+                (str(session_id),),
+            )
+            messages = list(cur.fetchall())
+            cur.execute(
+                """
+                SELECT id, sql_text, kind, risk, rows_affected, status,
+                       diff_summary, created_at, committed_at
+                FROM sentinel.actions
+                WHERE session_id = %s
+                ORDER BY created_at
+                """,
+                (str(session_id),),
+            )
+            actions = list(cur.fetchall())
+        return {"session_id": str(session_id), "messages": messages, "actions": actions}
 
     return app
 
