@@ -55,16 +55,16 @@ CREATE TABLE IF NOT EXISTS sentinel.rules (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS sentinel.tasks (
-    id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    family   STRING NOT NULL,
-    kind     STRING NOT NULL,
-    prompt   STRING NOT NULL,
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_family STRING NOT NULL,
+    kind        STRING NOT NULL,
+    prompt      STRING NOT NULL,
     -- For read tasks: the expected answer. For write tasks: a SQL predicate
     -- evaluated after the change that must return TRUE.
-    expected JSONB,
-    checker  STRING,
+    expected    JSONB,
+    checker     STRING,
     CONSTRAINT valid_kind CHECK (kind IN ('read', 'write')),
-    INDEX tasks_by_family (family)
+    INDEX tasks_by_family (task_family)
 );
 
 CREATE TABLE IF NOT EXISTS sentinel.rule_trials (

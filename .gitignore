@@ -2,6 +2,8 @@
 .env.local
 *.pem
 *.crt
+certs/*.crt
+!certs/.gitkeep
 
 __pycache__/
 *.py[cod]
