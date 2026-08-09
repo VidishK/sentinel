@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field
 
 from sentinel.agent.loop import run_turn
 from sentinel.db import connect
+from sentinel.memory.rules import create_rule, get_rule, list_rules
+from sentinel.memory.trials import evaluate_and_decide
 from sentinel.safety.preview import PreviewResult, approve_and_commit, preview_sql
 
 
@@ -24,8 +26,28 @@ class ApproveRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1)
-    session_id: UUID | None = None
+    message: str = Field(
+        min_length=1,
+        examples=["How many real non-test customers do we have?"],
+    )
+    # Omit on the first message. Reuse the session_id from the response after that.
+    session_id: UUID | None = Field(default=None, examples=[None])
+
+
+class CreateRuleRequest(BaseModel):
+    body: str = Field(min_length=1, examples=["Always exclude customers where is_test = true."])
+    trigger_text: str = Field(
+        min_length=1,
+        examples=["counting customers or reporting user metrics"],
+    )
+
+
+class EvaluateRuleRequest(BaseModel):
+    task_family: str | None = Field(
+        default=None,
+        examples=["test_accounts"],
+        description="Optional family filter to keep evals fast during demos",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -255,6 +277,32 @@ def create_app() -> FastAPI:
             )
             actions = list(cur.fetchall())
         return {"session_id": str(session_id), "messages": messages, "actions": actions}
+
+    @app.get("/rules")
+    def rules(status: str | None = None) -> dict[str, Any]:
+        return {"rules": list_rules(status)}
+
+    @app.get("/rules/{rule_id}")
+    def rule_detail(rule_id: UUID) -> dict[str, Any]:
+        rule = get_rule(str(rule_id))
+        if rule is None:
+            raise HTTPException(status_code=404, detail="rule not found")
+        return rule
+
+    @app.post("/rules")
+    def add_rule(body: CreateRuleRequest) -> dict[str, Any]:
+        try:
+            return create_rule(body.body, body.trigger_text, status="probation")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/rules/{rule_id}/evaluate")
+    def evaluate_rule(rule_id: UUID, body: EvaluateRuleRequest | None = None) -> dict[str, Any]:
+        family = body.task_family if body else None
+        try:
+            return evaluate_and_decide(str(rule_id), task_family=family)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return app
 

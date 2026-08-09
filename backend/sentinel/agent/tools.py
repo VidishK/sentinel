@@ -113,6 +113,33 @@ TOOL_SPECS: list[dict[str, Any]] = [
             },
         }
     },
+    {
+        "toolSpec": {
+            "name": "propose_rule",
+            "description": (
+                "Save a company how-to rule into probation memory. Use when the user "
+                "corrects you or states a durable convention (e.g. exclude test accounts, "
+                "subtract refunds). The rule is NOT trusted until it passes A/B evaluation."
+            ),
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "body": {
+                            "type": "string",
+                            "description": "The rule text the agent should follow later",
+                        },
+                        "trigger_text": {
+                            "type": "string",
+                            "description": "When this rule applies, in plain language",
+                        },
+                    },
+                    "required": ["body", "trigger_text"],
+                    "additionalProperties": False,
+                }
+            },
+        }
+    },
 ]
 
 
@@ -307,6 +334,24 @@ def propose_write(
     }
 
 
+def propose_rule(args: dict[str, Any]) -> dict[str, Any]:
+    from sentinel.memory.rules import create_rule
+
+    body = str(args.get("body", "")).strip()
+    trigger = str(args.get("trigger_text", "")).strip()
+    if not body or not trigger:
+        raise ValueError("body and trigger_text are required")
+    created = create_rule(body, trigger, status="probation")
+    return {
+        "status": "probation",
+        "message": (
+            "Rule saved in probation. It will not be followed until it passes "
+            "A/B evaluation against the held-out task set."
+        ),
+        **created,
+    }
+
+
 def dispatch(
     name: str,
     args: dict[str, Any],
@@ -318,6 +363,7 @@ def dispatch(
         "list_tables": list_tables,
         "describe_table": describe_table,
         "run_readonly_sql": run_readonly_sql,
+        "propose_rule": propose_rule,
     }
     if name == "propose_write":
         return propose_write(args, session_id=session_id, user_request=user_request)

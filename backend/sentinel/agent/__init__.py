@@ -1,4 +1,3 @@
-from .bedrock import chat, embed
-from .loop import run_turn
+from .bedrock import chat, embed, vector_literal
 
-__all__ = ["chat", "embed", "run_turn"]
+__all__ = ["chat", "embed", "vector_literal"]

@@ -11,6 +11,7 @@ import boto3
 from sentinel.agent.tools import TOOL_SPECS, dispatch
 from sentinel.config import get_settings
 from sentinel.db import connect
+from sentinel.memory.rules import format_rules_for_prompt, search_trusted_rules
 
 SYSTEM_PROMPT = """\
 You are Sentinel, an AI database agent that companies can safely give write \
@@ -26,7 +27,10 @@ tell the user the action_id and that they must approve it.
 refunds that must be subtracted from revenue, and price_history that should be \
 updated when prices change.
 6. Always use fully qualified names: company.customers, company.orders, etc.
-7. Be concise. Show numbers. When a preview comes back, summarize risk, rows \
+7. When the user corrects you or states a durable convention, call propose_rule \
+to save it into probation (not trusted yet).
+8. Obey any Trusted company rules listed below.
+9. Be concise. Show numbers. When a preview comes back, summarize risk, rows \
 affected, and the before/after clearly. Stop once you can answer — do not keep \
 calling tools after you have the result.
 """
@@ -38,12 +42,19 @@ def _runtime():
 
 
 def _ensure_session(session_id: str | None, title: str) -> str:
-    if session_id:
-        return session_id
-    new_id = str(uuid4())
+    """Return a valid session id, creating the row if needed.
+
+    Swagger / clients often send a placeholder UUID. If that id is not in
+    `sentinel.sessions` yet, create it instead of failing the FK on messages.
+    """
+    new_id = session_id or str(uuid4())
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO sentinel.sessions (id, title) VALUES (%s, %s)",
+            """
+            INSERT INTO sentinel.sessions (id, title)
+            VALUES (%s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
             (new_id, title[:80]),
         )
     return new_id
@@ -92,6 +103,9 @@ def run_turn(
     sid = _ensure_session(session_id, user_text)
     _persist_message(sid, "user", user_text)
 
+    trusted = search_trusted_rules(user_text, limit=5)
+    system = SYSTEM_PROMPT + "\n\n" + format_rules_for_prompt(trusted)
+
     messages = _load_history(sid)
     pending_previews: list[dict[str, Any]] = []
     client = _runtime()
@@ -99,7 +113,7 @@ def run_turn(
     for _ in range(max_tool_rounds):
         response = client.converse(
             modelId=settings.bedrock_model_id,
-            system=[{"text": SYSTEM_PROMPT}],
+            system=[{"text": system}],
             messages=messages,
             toolConfig={"tools": TOOL_SPECS},
             inferenceConfig={"maxTokens": 2048, "temperature": 0.0},
