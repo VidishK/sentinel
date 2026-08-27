@@ -12,15 +12,36 @@ from sentinel.config import get_settings
 _pool: ConnectionPool | None = None
 
 
-def get_pool() -> ConnectionPool:
+def close_pool() -> None:
     global _pool
     if _pool is None:
+        return
+    try:
+        _pool.close()
+    except Exception:  # noqa: BLE001
+        pass
+    _pool = None
+
+
+def get_pool() -> ConnectionPool:
+    global _pool
+    if _pool is None or _pool.closed:
         settings = get_settings()
         _pool = ConnectionPool(
             conninfo=settings.database_url,
             min_size=1,
             max_size=8,
-            kwargs={"row_factory": dict_row, "autocommit": False},
+            max_idle=120,
+            reconnect_timeout=30,
+            check=ConnectionPool.check_connection,
+            kwargs={
+                "row_factory": dict_row,
+                "autocommit": False,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
+            },
             open=True,
         )
     return _pool

@@ -12,10 +12,14 @@ from uuid import uuid4
 
 import boto3
 
-from sentinel.agent.tools import _qualify_company_tables
 from sentinel.config import get_settings
 from sentinel.db import connect
 
+
+def _qualify(sql: str) -> str:
+    from sentinel.agent.tools import _qualify_company_tables
+
+    return _qualify_company_tables(sql)
 
 def wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
     """Wilson score interval for a binomial proportion."""
@@ -65,7 +69,7 @@ def _ask_for_sql(prompt: str, rules_block: str | None) -> str:
     match = re.search(r"(SELECT\b[\s\S]+)", sql, re.IGNORECASE)
     if match:
         sql = match.group(1).strip().rstrip(";")
-    return _qualify_company_tables(sql)
+    return _qualify(sql)
 
 
 def _normalize(value: Any) -> Any:

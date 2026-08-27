@@ -9,14 +9,58 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 import psycopg
 from psycopg.rows import dict_row
 
 from sentinel.db import connect
 from sentinel.safety.risk import RiskAssessment, classify_risk
+
+
+def _same_sql_database(left: str, right: str) -> bool:
+    from urllib.parse import urlsplit
+
+    a, b = urlsplit(left), urlsplit(right)
+    return (a.hostname, a.port, a.path.rstrip("/").lower()) == (
+        b.hostname,
+        b.port,
+        b.path.rstrip("/").lower(),
+    )
+
+
+def _source_dsn() -> str | None:
+    try:
+        from sentinel.connectors.catalog import get_active
+        from sentinel.config import get_settings
+
+        active = get_active()
+        if active.get("engine") not in {"cockroach", "postgres"}:
+            return None
+        dsn = str(active.get("dsn") or "")
+        if dsn and not _same_sql_database(dsn, get_settings().database_url):
+            return dsn
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+@contextmanager
+def _sql_conn(*, autocommit: bool) -> Iterator[psycopg.Connection]:
+    dsn = _source_dsn()
+    if dsn:
+        with psycopg.connect(
+            dsn,
+            autocommit=autocommit,
+            row_factory=dict_row,
+            connect_timeout=15,
+        ) as conn:
+            yield conn
+        return
+    with connect(autocommit=autocommit) as conn:
+        yield conn
 
 _WRITE = re.compile(
     r"^\s*(INSERT|UPDATE|DELETE|UPSERT|MERGE|ALTER|DROP|TRUNCATE|CREATE)\b",
@@ -81,7 +125,7 @@ def preview_sql(sql_text: str) -> PreviewResult:
 
     # Reads don't need a rehearsal — just run them.
     if _SELECT.match(sql) and not _is_write(sql):
-        with connect(autocommit=True) as conn, conn.cursor() as cur:
+        with _sql_conn(autocommit=True) as conn, conn.cursor() as cur:
             cur.execute(sql)
             rows = list(cur.fetchall()) if cur.description else []
         risk = classify_risk(sql)
@@ -100,7 +144,7 @@ def preview_sql(sql_text: str) -> PreviewResult:
     rows_affected = 0
     error: str | None = None
 
-    with connect(autocommit=False) as conn:
+    with _sql_conn(autocommit=False) as conn:
         # Override the context manager's commit — we always roll back.
         try:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -141,12 +185,7 @@ def approve_and_commit(
     *,
     conn: psycopg.Connection | None = None,
 ) -> dict[str, Any]:
-    """Re-run SQL for real after the user approved the preview.
-
-    If `conn` is provided, the statement runs on that connection (so the
-    caller can update the action row in the same transaction). Otherwise a
-    fresh pooled connection is used and committed on success.
-    """
+    """Re-run SQL for real after approval or auto-apply."""
     sql = sql_text.strip().rstrip(";")
 
     if conn is not None:
@@ -155,9 +194,11 @@ def approve_and_commit(
             rows_affected = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
         return {"status": "committed", "rows_affected": rows_affected, "sql": sql}
 
-    with connect(autocommit=False) as owned, owned.cursor() as cur:
-        cur.execute(sql)
-        rows_affected = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    with _sql_conn(autocommit=False) as owned:
+        with owned.cursor() as cur:
+            cur.execute(sql)
+            rows_affected = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        owned.commit()
     return {"status": "committed", "rows_affected": rows_affected, "sql": sql}
 
 

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sentinel-memory": {
+      "command": ".venv/bin/python",
+      "args": ["-m", "sentinel.mcp_server"],
+      "cwd": "${workspaceFolder}/backend"
+    }
+  }
+}

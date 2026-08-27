@@ -2,67 +2,73 @@
 
 **Most AI database tools ask you to trust them. Sentinel proves itself before it touches anything.**
 
-Sentinel is an AI agent you can safely give write access to a company database. Every
-change it proposes is rehearsed inside a transaction and rolled back so you can see the
-exact rows it would touch before anything is committed. Risky operations take a real
-cluster backup first. And the agent only follows company rules that have measurably
-improved its accuracy on a held-out evaluation set.
+An AI agent you can give write access to a company database. Every proposed
+write is rehearsed in a transaction, the before/after rows are captured, and
+the transaction is rolled back until a human approves. High-risk commits
+record a Cockroach Cloud backup plus a `cluster_logical_timestamp()`. Rules
+the agent follows must earn `trusted` status on a held-out A/B eval.
 
-Built for the CockroachDB x AWS Hackathon: Build with Agentic Memory.
+Built for the [CockroachDB × AWS Hackathon: Build with Agentic Memory](https://cockroachdb-ai.devpost.com/).
 
-## Why this exists
+## What you get
 
-Text-to-SQL assistants are everywhere, and nearly all of them are read-only, because
-handing an AI write access to production is terrifying. The interesting problem is not
-"can the model write SQL" but "under what contract is it allowed to run it."
+- Chat agent (Amazon Nova Pro on Bedrock) scoped to the **active source**
+  (shared demo `company.*`, or a Postgres / Cockroach / Mongo you connect)
+- Sign-in, per-account sources, and a Sources tab to paste a connection string
+- Preview → Approve / Reject, with typed `COMMIT` on medium/high risk
+- Strict policy: catalog allowlist, DDL block, WHERE required, read-only mode
+- Vector memory: Titan embeddings + Cockroach `VECTOR(1024)` cosine indexes
+  over rules, schema docs, and past action intents
+- Rule library: probation → A/B trials → Wilson-gated promotion
+- ccloud backup listing recorded on high-risk commits
+- MCP server so Cursor/Claude can interrogate the same memory layer
 
-There is a second, quieter failure. Agents that write their own how-to notes get *worse*
-on average: SkillsBench (arXiv:2602.12670, 7,308 trajectories) found human-curated skills
-raise agent pass rates by 16.2 points while self-generated skills come in at -1.3. Nothing
-validates a note before the agent starts relying on it. Sentinel's rule library is that
-missing gate.
+## Hackathon mapping
 
-## The three guarantees
+Required: **≥2 CockroachDB tools** and **≥1 AWS service**, used for real.
 
-1. **Nothing commits unseen.** Proposed writes execute inside a transaction, the affected
-   rows are captured before and after, then the transaction is rolled back and the diff is
-   shown. The statement only runs for real after explicit approval.
-2. **Nothing risky happens without an undo.** A deterministic risk classifier (DDL, missing
-   `WHERE`, row count over threshold) forces a `ccloud` backup before commit.
-3. **No unproven rule is ever followed.** New rules enter `probation` and are only promoted
-   to `trusted` after an A/B comparison across the evaluation set clears a Wilson score
-   interval. Rules that stop helping are demoted automatically.
+| Requirement | What Sentinel actually does |
+|-------------|-----------------------------|
+| **Distributed vector indexing** | `VECTOR(1024)` + cosine indexes on `sentinel.rules`, `sentinel.actions.intent_embedding`, and `sentinel.schema_docs`. Every chat turn retrieves trusted rules, schema blurbs, and similar past writes. The Rules tab runs the same search. |
+| **ccloud CLI (agent-ready)** | Cluster `sentinel` was provisioned with ccloud. High-risk approve calls `ccloud cluster backup list` and stores the latest backup id + `cluster_logical_timestamp()` on the action. Safety shows recent undo points. |
+| **Managed MCP Server** | Cockroach Cloud MCP can be added from the Cloud Console (read-only SQL over the cluster). Sentinel also ships `python -m sentinel.mcp_server` for rule/schema/action retrieval. |
+| **Agent Skills** | Project skill at `.cursor/skills/sentinel-cockroach-memory/SKILL.md` encodes the preview/allowlist/memory contract. |
+| **Amazon Bedrock** | Nova Pro (`amazon.nova-pro-v1:0`) for chat + SQL; Titan Text Embeddings V2 (`amazon.titan-embed-text-v2:0`) for 1024-dim vectors. |
 
 ## Architecture
 
 ```
-User -> FastAPI (Lambda) -> Bedrock Claude
-                |
-                +-- vector search over rules, past actions, schema  --> CockroachDB
-                +-- deterministic risk classifier (Lambda)
-                +-- ccloud backup guard
-                +-- transaction preview / rollback / commit
-                +-- audit trail                                      --> CockroachDB
+User (Vite UI)
+    → FastAPI
+        → Bedrock Nova Pro  (reason + tool calls)
+        → Titan embeddings  (rules / schema / action intents)
+        → CockroachDB Cloud `defaultdb`
+              company.*     demo operational data
+              sentinel.*    sessions, rules, trials, actions, audit, vectors
+        → ccloud backup list  (high-risk restore point)
 ```
-
-CockroachDB holds the operational data, the rule library, the embeddings (`VECTOR(1024)`
-columns with cosine vector indexes), the trial evidence, and the audit trail in one
-database. Its transactions are what make the preview possible at all.
 
 ## Layout
 
 ```
-backend/sql/001_sentinel_schema.sql   control plane: rules, trials, actions, audit
-backend/sql/002_company_seed.sql      the demo company database the agent operates on
-backend/sentinel/                     FastAPI app: agent, memory, safety, api
-scripts/validate_cluster.py           day-0 checks: vector index, rollback, time travel
-frontend/                             chat plus the live memory panel
+backend/sql/001_sentinel_schema.sql   control plane + VECTOR indexes
+backend/sql/002_company_seed.sql      demo company database
+backend/sql/003_eval_tasks.sql        A/B tasks for rule promotion
+backend/sentinel/                     FastAPI app
+  agent/     Bedrock loop + tools
+  memory/    rules, trials, schema docs, action embeddings
+  safety/    preview, risk, policy, backup guard
+  mcp_server.py
+frontend/                              chat + live memory
+scripts/validate_cluster.py            vector index, rollback, time travel
+.cursor/skills/                        agent skill
+.cursor/mcp.json.example               Sentinel MCP snippet
 ```
 
 ## Setup
 
-Requires Python 3.12+, Node 20+, the `ccloud` CLI, and an AWS account with Bedrock model
-access for Claude and Titan Text Embeddings V2.
+Requires Python 3.12+, Node 20+, the `ccloud` CLI, and AWS Bedrock access
+for Nova Pro and Titan Text Embeddings V2.
 
 ```bash
 # 1. Cluster
@@ -70,32 +76,41 @@ ccloud auth login
 ccloud cluster create basic sentinel us-east-1 --cloud AWS
 
 # 2. Environment
-cp .env.example .env        # fill in DATABASE_URL and ARTIFACT_BUCKET
+cp .env.example .env        # DATABASE_URL, AWS region, cluster name
 python3 -m venv .venv
 .venv/bin/pip install -r backend/requirements.txt
 
-# 3. Verify the cluster does what the design assumes
+# 3. Day-0 checks (vector index, rollback, AS OF SYSTEM TIME)
 .venv/bin/python scripts/validate_cluster.py
 
-# 4. Schema and seed data
+# 4. Schema and seed
 .venv/bin/python scripts/apply_sql.py backend/sql/001_sentinel_schema.sql
 .venv/bin/python scripts/apply_sql.py backend/sql/002_company_seed.sql
+.venv/bin/python scripts/apply_sql.py backend/sql/003_eval_tasks.sql
 ```
 
-## CockroachDB tools used
+## Run locally
 
-- **Distributed vector indexing** - cosine indexes over rule triggers and action intents,
-  powering rule retrieval, duplicate/contradiction detection, and semantic audit search.
-- **Managed MCP Server** - a read-only view over the rule library and audit trail, so the
-  memory can be interrogated directly from Claude or Cursor.
-- **ccloud CLI** - cluster provisioning, and the backup taken before every high-risk action.
+```bash
+# API
+cd backend && ../.venv/bin/uvicorn sentinel.main:app --host 127.0.0.1 --port 8001 --reload
 
-## AWS services used
+# UI (proxies /api → 8001)
+cd frontend && npm install && npm run dev
+```
 
-- **Amazon Bedrock** - Claude for reasoning and SQL generation, Titan Text Embeddings V2
-  for the 1024-dimension vectors.
-- **AWS Lambda** - the API, the deterministic risk classifier, and parallel rule trials.
-- **Amazon S3** - change diffs, trial artifacts, and static frontend hosting.
+Open http://127.0.0.1:5173
+
+Sign up, then open **Sources**. Paste a `postgresql://…` or `mongodb://…`
+string for a database this machine can reach. Memory stays on Cockroach
+(`sentinel.*`); the agent reads and rehearses writes against the source you
+activated. The shared demo is playground data.
+
+Optional MCP (from repo root, after copying `.cursor/mcp.json.example` to `.cursor/mcp.json`):
+
+```bash
+cd backend && ../.venv/bin/python -m sentinel.mcp_server
+```
 
 ## License
 

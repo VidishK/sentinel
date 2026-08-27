@@ -5,7 +5,6 @@ from .rules import (
     list_rules,
     search_trusted_rules,
 )
-from .trials import evaluate_and_decide, run_ab_trials, wilson_interval
 
 __all__ = [
     "create_rule",
@@ -13,7 +12,4 @@ __all__ = [
     "get_rule",
     "list_rules",
     "search_trusted_rules",
-    "evaluate_and_decide",
-    "run_ab_trials",
-    "wilson_interval",
 ]

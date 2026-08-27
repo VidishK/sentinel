@@ -1,7 +1,7 @@
 """Tools the chat agent is allowed to call.
 
-Writes never execute here. They go through the preview engine and wait for
-human approval. Reads are allowed, but only against the `company` schema.
+Reads run against the active data source. Writes are rehearsed first.
+Bounded low-risk writes may auto-commit; medium/high still wait in Preview.
 """
 
 from __future__ import annotations
@@ -12,7 +12,14 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from sentinel.db import connect
-from sentinel.safety.preview import preview_sql
+from sentinel.memory.actions import embed_action_intent
+from sentinel.safety.policy import (
+    PolicyViolation,
+    enforce_write_proposal,
+    get_policy,
+    should_auto_apply,
+)
+from sentinel.safety.preview import approve_and_commit, preview_sql
 
 _COMPANY_IDENT = re.compile(
     r"\b(company\.[A-Za-z_][\w]*|[A-Za-z_][\w]*)\b",
@@ -29,8 +36,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "toolSpec": {
             "name": "list_tables",
             "description": (
-                "List tables in the company schema the agent may query or modify. "
-                "Call this before writing SQL if you are unsure of table names."
+                "List tables/collections on the active data source "
+                "(Cockroach, Postgres, or MongoDB). Call this before writing queries."
             ),
             "inputSchema": {
                 "json": {
@@ -45,8 +52,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "toolSpec": {
             "name": "describe_table",
             "description": (
-                "Describe columns for a company table. "
-                "Pass the bare table name, e.g. 'customers' or 'orders'."
+                "Describe columns or fields for a table/collection on the active source. "
+                "Pass customers, orders, or a qualified name like public.users."
             ),
             "inputSchema": {
                 "json": {
@@ -67,8 +74,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "toolSpec": {
             "name": "run_readonly_sql",
             "description": (
-                "Run a read-only SELECT against the company schema and return rows. "
-                "Use this to answer questions. Never use it for INSERT/UPDATE/DELETE."
+                "Run a read-only SELECT on the active SQL source. "
+                "Never use it for INSERT/UPDATE/DELETE. For MongoDB use mongo_find."
             ),
             "inputSchema": {
                 "json": {
@@ -89,10 +96,10 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "toolSpec": {
             "name": "propose_write",
             "description": (
-                "Propose a write (INSERT/UPDATE/DELETE/DDL). The statement is rehearsed "
-                "inside a rolled-back transaction and the diff is shown to the user. "
-                "Nothing is committed until the user explicitly approves. "
-                "Always call this instead of running writes yourself."
+                "Propose a SQL write on the active SQL source. The statement is rehearsed "
+                "inside a rolled-back transaction. Bounded low-risk writes may auto-commit; "
+                "medium/high risk wait for human approval. Always call this instead of "
+                "running writes yourself."
             ),
             "inputSchema": {
                 "json": {
@@ -117,9 +124,9 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "toolSpec": {
             "name": "propose_rule",
             "description": (
-                "Save a company how-to rule into probation memory. Use when the user "
-                "corrects you or states a durable convention (e.g. exclude test accounts, "
-                "subtract refunds). The rule is NOT trusted until it passes A/B evaluation."
+                "Save a how-to rule into probation memory. Use when the user "
+                "corrects you or states a durable convention. The rule is NOT trusted "
+                "until it passes A/B evaluation."
             ),
             "inputSchema": {
                 "json": {
@@ -135,6 +142,53 @@ TOOL_SPECS: list[dict[str, Any]] = [
                         },
                     },
                     "required": ["body", "trigger_text"],
+                    "additionalProperties": False,
+                }
+            },
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "mongo_find",
+            "description": (
+                "Read documents from a MongoDB collection on the active source. "
+                "filter_json is a Mongo filter object as JSON, e.g. {\"status\":\"open\"}."
+            ),
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "collection": {"type": "string"},
+                        "filter_json": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["collection"],
+                    "additionalProperties": False,
+                }
+            },
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "mongo_propose_write",
+            "description": (
+                "Propose a MongoDB updateMany/deleteMany on one collection. "
+                "Low-risk single-document updates may auto-apply; broader writes wait."
+            ),
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "collection": {"type": "string"},
+                        "operation": {
+                            "type": "string",
+                            "description": "update or delete",
+                        },
+                        "filter_json": {"type": "string"},
+                        "update_json": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["collection", "operation", "filter_json", "rationale"],
                     "additionalProperties": False,
                 }
             },
@@ -157,23 +211,12 @@ _COMPANY_TABLES = {
 def _assert_company_only(sql: str) -> None:
     if _FORBIDDEN.search(sql):
         raise ValueError(
-            "SQL may only touch the company schema; "
-            "sentinel/system catalogs are off limits"
+            "SQL may not touch sentinel/system catalogs"
         )
-    # If a schema is mentioned, it must be company.
-    for match in re.finditer(r"\b([A-Za-z_][\w]*)\.", sql):
-        schema = match.group(1).lower()
-        if schema not in {"company"}:
-            raise ValueError(f"schema '{schema}' is not allowed; use company.*")
 
 
 def _qualify_company_tables(sql: str) -> str:
-    """Rewrite bare company table names to company.<table>.
-
-    Models often omit the schema; we force the namespace so generated SQL
-    cannot accidentally hit public/sentinel.
-    """
-    # Skip tokens that are already schema-qualified (company.customers).
+    """Rewrite bare table names from the active catalog (demo or connected)."""
     patterns = [
         r"\bFROM\s+([A-Za-z_][\w]*)\b(?!\s*\.)",
         r"\bJOIN\s+([A-Za-z_][\w]*)\b(?!\s*\.)",
@@ -181,16 +224,32 @@ def _qualify_company_tables(sql: str) -> str:
         r"\bUPDATE\s+([A-Za-z_][\w]*)\b(?!\s*\.)",
         r"\bTABLE\s+([A-Za-z_][\w]*)\b(?!\s*\.)",
     ]
+    aliases: dict[str, str] = {}
+    try:
+        from sentinel.connectors.catalog import allowed_objects
+
+        by_name: dict[str, list[str]] = {}
+        for qualified in allowed_objects():
+            by_name.setdefault(qualified.split(".")[-1].lower(), []).append(qualified)
+        for name, matches in by_name.items():
+            if len(matches) == 1:
+                aliases[name] = matches[0]
+        if not aliases:
+            aliases = {name: f"company.{name}" for name in _COMPANY_TABLES}
+    except Exception:  # noqa: BLE001
+        aliases = {name: f"company.{name}" for name in _COMPANY_TABLES}
+
     out = sql
     for pat in patterns:
 
-        def _sub(m: re.Match[str]) -> str:
+        def _sub(m: re.Match[str], names: dict[str, str] = aliases) -> str:
             full = m.group(0)
             table = m.group(1)
             if "." in full:
                 return full
-            if table.lower() in _COMPANY_TABLES:
-                return full.replace(table, f"company.{table}", 1)
+            mapped = names.get(table.lower())
+            if mapped:
+                return full.replace(table, mapped, 1)
             return full
 
         out = re.sub(pat, _sub, out, flags=re.IGNORECASE)
@@ -198,43 +257,48 @@ def _qualify_company_tables(sql: str) -> str:
 
 
 def list_tables(_: dict[str, Any]) -> dict[str, Any]:
-    with connect(autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'company'
-            ORDER BY table_name
-            """
-        )
-        tables = [row["table_name"] for row in cur.fetchall()]
+    from sentinel.connectors.catalog import get_active
+
+    active = get_active()
+    catalog = active.get("catalog") or {}
+    if isinstance(catalog, str):
+        catalog = json.loads(catalog)
+    objects = catalog.get("objects") or []
     return {
-        "tables": [f"company.{t}" for t in tables],
-        "note": "Always qualify tables as company.<name> in SQL.",
+        "source": active.get("name"),
+        "engine": active.get("engine"),
+        "tables": [o.get("qualified") for o in objects],
+        "note": "Query only objects listed here. Refresh the source catalog if this looks stale.",
     }
 
 
 def describe_table(args: dict[str, Any]) -> dict[str, Any]:
-    table = str(args.get("table", "")).strip().lower()
-    if not re.fullmatch(r"[a-z_][a-z0-9_]*", table):
-        raise ValueError("invalid table name")
-    with connect(autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = 'company' AND table_name = %s
-            ORDER BY ordinal_position
-            """,
-            (table,),
-        )
-        cols = list(cur.fetchall())
-    if not cols:
-        raise ValueError(f"unknown company table: {table}")
-    return {"table": table, "columns": cols}
+    from sentinel.connectors.catalog import get_active
+
+    table = str(args.get("table", "")).strip()
+    if not table:
+        raise ValueError("table is required")
+    active = get_active()
+    catalog = active.get("catalog") or {}
+    if isinstance(catalog, str):
+        catalog = json.loads(catalog)
+    needle = table.lower().split(".")[-1]
+    for obj in catalog.get("objects") or []:
+        if obj.get("name", "").lower() == needle or obj.get("qualified", "").lower() == table.lower():
+            return {
+                "table": obj.get("qualified"),
+                "engine": active["engine"],
+                "columns": obj.get("columns") or [],
+            }
+    raise ValueError(f"unknown table on active source: {table}")
 
 
 def run_readonly_sql(args: dict[str, Any]) -> dict[str, Any]:
+    from sentinel.connectors.catalog import get_active
+
+    active = get_active()
+    if active["engine"] == "mongodb":
+        raise ValueError("Active source is MongoDB. Use mongo_find instead of SQL.")
     sql = _qualify_company_tables(str(args.get("sql", "")).strip().rstrip(";"))
     if not re.match(r"^\s*SELECT\b", sql, re.IGNORECASE):
         raise ValueError("run_readonly_sql only accepts SELECT statements")
@@ -242,10 +306,14 @@ def run_readonly_sql(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("write keywords are not allowed in run_readonly_sql")
     _assert_company_only(sql)
 
-    with connect(autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(sql)
-        rows = list(cur.fetchall())
-    return {"sql": sql, "row_count": len(rows), "rows": rows[:50]}
+    preview = preview_sql(sql)
+    if preview.error:
+        raise ValueError(preview.error)
+    return {
+        "sql": sql,
+        "row_count": preview.rows_affected,
+        "rows": preview.result_rows[:50],
+    }
 
 
 def propose_write(
@@ -254,13 +322,34 @@ def propose_write(
     session_id: str,
     user_request: str,
 ) -> dict[str, Any]:
+    from sentinel.connectors.catalog import get_active
+
+    active = get_active()
+    if active["engine"] == "mongodb":
+        raise ValueError("Active source is MongoDB. Use mongo_propose_write.")
     sql = _qualify_company_tables(str(args.get("sql", "")).strip().rstrip(";"))
     rationale = str(args.get("rationale", "")).strip()
     if not sql:
         raise ValueError("sql is required")
+    if not rationale:
+        raise ValueError("rationale is required for every write proposal")
     _assert_company_only(sql)
+    try:
+        enforce_write_proposal(sql)
+    except PolicyViolation as exc:
+        raise ValueError(str(exc)) from exc
 
     preview = preview_sql(sql)
+    policy = get_policy()
+    if (
+        preview.rows_affected is not None
+        and preview.rows_affected > policy.max_preview_rows
+        and preview.error is None
+    ):
+        preview.error = (
+            f"Blocked: would touch {preview.rows_affected} rows "
+            f"(max {policy.max_preview_rows}). Narrow the WHERE clause."
+        )
     action_id = str(uuid4())
 
     with connect() as conn, conn.cursor() as cur:
@@ -268,10 +357,10 @@ def propose_write(
             """
             INSERT INTO sentinel.actions (
                 id, session_id, request, sql_text, kind, risk,
-                risk_reasons, rows_affected, diff_summary, status
+                risk_reasons, rows_affected, diff_summary, status, source_id
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
-                %s::jsonb, %s, %s::jsonb, %s
+                %s::jsonb, %s, %s::jsonb, %s, %s
             )
             """,
             (
@@ -285,6 +374,7 @@ def propose_write(
                 preview.rows_affected,
                 json.dumps(preview.summary, default=str),
                 "previewed" if preview.error is None else "failed",
+                str(active["id"]),
             ),
         )
         cur.execute(
@@ -311,6 +401,80 @@ def propose_write(
             ),
         )
 
+    # Titan embedding for semantic recall of past writes / audits.
+    try:
+        embed_action_intent(
+            action_id,
+            f"{user_request}\n{rationale}\n{preview.sql_text}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    auto = (
+        preview.error is None
+        and should_auto_apply(preview.risk.level, preview.rows_affected)
+    )
+    if auto:
+        try:
+            commit = approve_and_commit(preview.sql_text)
+            with connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE sentinel.actions
+                    SET status = 'committed', committed_at = now()
+                    WHERE id = %s
+                    """,
+                    (action_id,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO sentinel.audit_events
+                        (action_id, event_type, actor, payload)
+                    VALUES (%s, 'auto_committed', 'agent', %s::jsonb)
+                    """,
+                    (
+                        action_id,
+                        json.dumps(
+                            {"reason": "low-risk bounded write", **commit},
+                            default=str,
+                        ),
+                    ),
+                )
+            return {
+                "action_id": action_id,
+                "status": "auto_committed",
+                "sql": preview.sql_text,
+                "rationale": rationale,
+                "risk": {
+                    "level": preview.risk.level,
+                    "reasons": preview.risk.reasons,
+                    "requires_backup": preview.risk.requires_backup,
+                },
+                "rows_affected": preview.rows_affected,
+                "before_sample": preview.before[:5],
+                "after_sample": preview.after[:5],
+                "error": None,
+                "message": (
+                    f"Applied. Low-risk write, {preview.rows_affected} row(s). "
+                    "Logged in Audit."
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "action_id": action_id,
+                "status": "failed",
+                "sql": preview.sql_text,
+                "rationale": rationale,
+                "risk": {
+                    "level": preview.risk.level,
+                    "reasons": preview.risk.reasons,
+                    "requires_backup": False,
+                },
+                "rows_affected": preview.rows_affected,
+                "error": str(exc),
+                "message": f"Auto-apply failed: {exc}",
+            }
+
     return {
         "action_id": action_id,
         "status": "awaiting_approval" if preview.error is None else "failed",
@@ -326,11 +490,186 @@ def propose_write(
         "after_sample": preview.after[:5],
         "error": preview.error,
         "message": (
-            "Change was rehearsed and rolled back. "
-            "It is NOT committed. The user must approve action_id to apply it."
+            "Rehearsed, not committed. Waiting in Preview."
             if preview.error is None
             else f"Preview failed: {preview.error}"
         ),
+    }
+
+
+def mongo_find(args: dict[str, Any]) -> dict[str, Any]:
+    from urllib.parse import urlparse
+
+    from pymongo import MongoClient
+
+    from sentinel.connectors.catalog import get_active
+
+    active = get_active()
+    if active["engine"] != "mongodb":
+        raise ValueError("Active source is not MongoDB.")
+    collection = str(args.get("collection", "")).strip()
+    if not collection:
+        raise ValueError("collection is required")
+    try:
+        filt = json.loads(str(args.get("filter_json") or "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("filter_json must be JSON") from exc
+    limit = min(int(args.get("limit") or 20), 50)
+    db_name = (urlparse(active["dsn"]).path or "").lstrip("/") or "test"
+    client = MongoClient(active["dsn"], serverSelectionTimeoutMS=8000)
+    try:
+        docs = list(client[db_name][collection].find(filt).limit(limit))
+        for doc in docs:
+            if "_id" in doc:
+                doc["_id"] = str(doc["_id"])
+        return {"collection": collection, "count": len(docs), "documents": docs}
+    finally:
+        client.close()
+
+
+def mongo_propose_write(
+    args: dict[str, Any],
+    *,
+    session_id: str,
+    user_request: str,
+) -> dict[str, Any]:
+    from urllib.parse import urlparse
+
+    from pymongo import MongoClient
+
+    from sentinel.connectors.catalog import get_active
+
+    active = get_active()
+    if active["engine"] != "mongodb":
+        raise ValueError("Active source is not MongoDB.")
+    collection = str(args.get("collection", "")).strip()
+    operation = str(args.get("operation", "update")).strip().lower()
+    rationale = str(args.get("rationale", "")).strip()
+    if operation not in {"update", "delete"}:
+        raise ValueError("operation must be update or delete")
+    try:
+        filt = json.loads(str(args.get("filter_json") or "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("filter_json must be JSON") from exc
+    if not filt:
+        raise ValueError("Mongo writes require a non-empty filter.")
+    update_doc: dict[str, Any] = {}
+    if operation == "update":
+        try:
+            update_doc = json.loads(str(args.get("update_json") or "{}"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("update_json must be JSON") from exc
+        if not update_doc:
+            raise ValueError("update_json is required for update")
+        if not any(str(k).startswith("$") for k in update_doc):
+            update_doc = {"$set": update_doc}
+
+    db_name = (urlparse(active["dsn"]).path or "").lstrip("/") or "test"
+    client = MongoClient(active["dsn"], serverSelectionTimeoutMS=8000)
+    try:
+        coll = client[db_name][collection]
+        before = list(coll.find(filt).limit(20))
+        matched = coll.count_documents(filt)
+        for doc in before:
+            if "_id" in doc:
+                doc["_id"] = str(doc["_id"])
+    finally:
+        client.close()
+
+    risk_level = "low" if matched <= 1 else ("medium" if matched <= 25 else "high")
+    action_id = str(uuid4())
+    sql_text = json.dumps(
+        {
+            "engine": "mongodb",
+            "collection": collection,
+            "operation": operation,
+            "filter": filt,
+            "update": update_doc,
+        },
+        default=str,
+    )
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO sentinel.actions (
+                id, session_id, request, sql_text, kind, risk,
+                risk_reasons, rows_affected, diff_summary, status, source_id
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s,
+                %s::jsonb, %s, %s::jsonb, %s, %s
+            )
+            """,
+            (
+                action_id,
+                session_id,
+                f"{user_request}\n\n{rationale}",
+                sql_text,
+                "write",
+                risk_level,
+                json.dumps([f"mongodb {operation} matched {matched}"]),
+                matched,
+                json.dumps({"before_sample": before[:5]}, default=str),
+                "previewed",
+                str(active["id"]),
+            ),
+        )
+
+    if should_auto_apply(risk_level, matched):
+        client = MongoClient(active["dsn"], serverSelectionTimeoutMS=8000)
+        try:
+            coll = client[db_name][collection]
+            if operation == "delete":
+                applied = coll.delete_many(filt).deleted_count
+            else:
+                applied = coll.update_many(filt, update_doc).modified_count
+        finally:
+            client.close()
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE sentinel.actions
+                SET status = 'committed', committed_at = now(), rows_affected = %s
+                WHERE id = %s
+                """,
+                (applied, action_id),
+            )
+            cur.execute(
+                """
+                INSERT INTO sentinel.audit_events
+                    (action_id, event_type, actor, payload)
+                VALUES (%s, 'auto_committed', 'agent', %s::jsonb)
+                """,
+                (
+                    action_id,
+                    json.dumps(
+                        {
+                            "reason": "low-risk bounded mongo write",
+                            "rows_affected": applied,
+                        },
+                        default=str,
+                    ),
+                ),
+            )
+        return {
+            "action_id": action_id,
+            "status": "auto_committed",
+            "rows_affected": applied,
+            "message": f"Applied Mongo {operation} on {applied} document(s).",
+        }
+
+    return {
+        "action_id": action_id,
+        "status": "awaiting_approval",
+        "sql": sql_text,
+        "rationale": rationale,
+        "risk": {
+            "level": risk_level,
+            "reasons": [f"mongodb {operation} matched {matched}"],
+            "requires_backup": risk_level == "high",
+        },
+        "rows_affected": matched,
+        "before_sample": before[:5],
+        "message": "Rehearsed, not committed. Waiting in Preview.",
     }
 
 
@@ -364,9 +703,14 @@ def dispatch(
         "describe_table": describe_table,
         "run_readonly_sql": run_readonly_sql,
         "propose_rule": propose_rule,
+        "mongo_find": mongo_find,
     }
     if name == "propose_write":
         return propose_write(args, session_id=session_id, user_request=user_request)
+    if name == "mongo_propose_write":
+        return mongo_propose_write(
+            args, session_id=session_id, user_request=user_request
+        )
     if name not in handlers:
         raise ValueError(f"unknown tool: {name}")
     return handlers[name](args)
