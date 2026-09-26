@@ -8,7 +8,6 @@ the transaction is rolled back until a human approves. High-risk commits
 record a Cockroach Cloud backup plus a `cluster_logical_timestamp()`. Rules
 the agent follows must earn `trusted` status on a held-out A/B eval.
 
-Built for the [CockroachDB × AWS Hackathon: Build with Agentic Memory](https://cockroachdb-ai.devpost.com/).
 
 ## What you get
 
@@ -23,7 +22,6 @@ Built for the [CockroachDB × AWS Hackathon: Build with Agentic Memory](https://
 - ccloud backup listing recorded on high-risk commits
 - MCP server so Cursor/Claude can interrogate the same memory layer
 
-## Hackathon mapping
 
 Required: **≥2 CockroachDB tools** and **≥1 AWS service**, used for real.
 
